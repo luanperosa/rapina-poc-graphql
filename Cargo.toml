@@ -1,0 +1,23 @@
+[package]
+name = "rapina-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rapina = "0.5.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hyper = "1"
+http = "1"
+bytes = "1"
+http-body-util = "0.1"
+
+juniper = "0.16"
+mysql = "24"
+r2d2 = "0.8"
+r2d2_mysql = "24"
+dotenvy = "0.15"
+env_logger = "0.11"
+log = "0.4"
+uuid = { version = "1", features = ["v4"] }

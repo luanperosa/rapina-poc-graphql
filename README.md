@@ -5,7 +5,7 @@
 ### 1. Clone the repository
 
 ```bash
-git clone [rapina-poc-graphql](https://github.com/luanperosa/rapina-poc-graphql) && cd rapina-poc-graphql
+git clone (https://github.com/luanperosa/rapina-poc-graphql) && cd rapina-poc-graphql
 ```
 
 ### 2. Configure environment variables

@@ -1,12 +1,7 @@
-use rapina::prelude::*;
 use rapina::middleware::RequestLogMiddleware;
-
-mod db;
-mod handlers;
-mod schemas;
-
-use self::db::get_db_pool;
-use self::handlers::{GraphQLState, graphql, graphql_get, graphql_playground};
+use rapina::prelude::*;
+use rapina_app::db::get_db_pool;
+use rapina_app::handlers::{GraphQLState, graphql, graphql_get, graphql_playground};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

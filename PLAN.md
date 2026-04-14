@@ -1,137 +1,418 @@
-# GraphQL Support in Rapina - Implementation Plan
+# GraphQL Support in Rapina — Implementation Plan
 
 ## Context
 
-Rapina needs first-class GraphQL support. So I created a Proof of Concept using Rapina and [Juniper](https://crates.io/crates/juniper). The POC works but relies on low-level manual wiring: handlers build raw `http::Response<BoxBody>`, there is no integration with Rapina's error envelope (`trace_id`), and authentication info is not passed into the GraphQL context.
+Rapina needs first-class GraphQL support. A Proof of Concept was built using Rapina with both [Juniper](https://crates.io/crates/juniper) and [async-graphql](https://crates.io/crates/async-graphql). The POC works but relies on low-level manual wiring: handlers build raw `http::Response<BoxBody>`, there is no integration with Rapina's error envelope (`trace_id`), and authentication info is not passed into the GraphQL context.
+
+After review, **async-graphql** was chosen over Juniper. It has a more ergonomic derive-based API (`#[Object]`, `#[SimpleObject]`, `#[InputObject]`), native async execution, built-in `DataLoader` support, and a larger community. The implementation will live behind a **feature flag** (`rapina = { features = ["graphql"] }`) so REST-only users aren't penalized with extra compile time or binary size.
 
 ---
 
-## Plan: Juniper GraphQL Module
+## Plan: async-graphql Module
 
-TL;DR — Add a `rapina::graphql` module that provides: a `GraphQLRequest` extractor, a `GraphQLResponse` responder, a context builder that bridges Rapina's `CurrentUser` and `trace_id` into Juniper, an error adapter between `rapina::Error` ↔ `juniper::FieldError`, and router helpers to mount GraphQL + GraphiQL routes in one call.
+TL;DR — Add a `rapina::graphql` module (gated behind `#[cfg(feature = "graphql")]`) that provides: a `GraphQLRequest` extractor, a `GraphQLResponse` responder, a context builder that bridges Rapina's `CurrentUser` and `trace_id` into async-graphql's `Context`, an error adapter between `rapina::Error` and async-graphql errors, and builder methods on `Rapina` to mount GraphQL + GraphiQL routes ergonomically.
 
 ---
 
-### Steps
+## PR Breakdown
 
-#### 1. Create the module graphql
+The implementation is split into incremental, self-contained PRs. Each one is reviewable and testable on its own.
 
-Add a new `graphql` module (rapina/src/graphql/) to the crate and re-export its public API from `rapina/src/lib.rs`.
+| PR | Scope | Depends on |
+|----|-------|------------|
+| **#1** | `GraphQLRequest` extractor + `GraphQLResponse` responder | — |
+| **#2** | `RapinaGraphQLContext` with auth/trace_id bridging + error adapter | PR #1 |
+| **#3** | Router extensions (`.graphql()` / `.graphiql()` builder methods) | PR #1, #2 |
+| **#4** | GraphiQL playground + docs page + example | PR #3 |
 
-#### 2. `GraphQLRequest` extractor — `rapina/src/graphql/request.rs`
+---
+
+## Steps
+
+### 1. Create the module and feature flag
+
+Add a new `graphql` module (`rapina/src/graphql/`) gated behind a cargo feature:
+
+```toml
+# rapina/Cargo.toml
+[features]
+default = []
+graphql = ["dep:async-graphql"]
+
+[dependencies]
+async-graphql = { version = "7", optional = true }
+```
+
+In `rapina/src/lib.rs`:
+
+```rust
+#[cfg(feature = "graphql")]
+pub mod graphql;
+```
+
+Re-export key types from `rapina::graphql` so users import from one place.
+
+**PR: #1**
+
+---
+
+### 2. `GraphQLRequest` extractor — `rapina/src/graphql/request.rs`
 
 Create a unified `GraphQLRequest` extractor implementing `FromRequest`. It inspects the HTTP method:
-- **POST** → deserialize the JSON body into `juniper::http::GraphQLRequest` (same as `Json<GraphQLRequest>` today).
-- **GET** → deserialize query parameters into `juniper::http::GraphQLRequest` (same as `Query<GraphQLRequest>` today).
 
-This replaces the need for separate POST/GET handlers with different extractor types. A single handler can call `graphql_request.execute(&schema, &ctx).await`.
+- **POST** → deserialize the JSON body into `async_graphql::Request`.
+- **GET** → deserialize query parameters (`query`, `variables`, `operationName`) into `async_graphql::Request`.
 
-Also register the type name in `is_parts_only_extractor()` inside `rapina-macros/src/lib.rs` — since it consumes the body on POST, it is **not** parts-only (it implements `FromRequest`, not `FromRequestParts`). The macro already handles `FromRequest` types correctly, so no change needed there beyond ensuring the type is recognized.
+async-graphql's `Request` already supports serde deserialization, so the POST path is straightforward. For GET, we deserialize a helper struct from query params and convert it:
 
-#### 3. `GraphQLResponse` responder — `rapina/src/graphql/response.rs`
+```rust
+/// Intermediate struct for GET query-param extraction.
+#[derive(Deserialize)]
+struct GraphQLParams {
+    query: String,
+    #[serde(default)]
+    variables: Option<String>,
+    #[serde(default, rename = "operationName")]
+    operation_name: Option<String>,
+}
+```
 
-Create a `GraphQLResponse` struct that wraps `juniper::GraphQLResponse` (or the raw `serde_json::Value` from execution) and implements `IntoResponse`:
-- Sets `Content-Type: application/json`.
-- Sets HTTP status 200 for successful responses, 400 if the GraphQL result contains only errors.
-- Serializes the Juniper response to JSON.
+The extractor wraps an `async_graphql::Request` and exposes it for execution:
+
+```rust
+pub struct GraphQLRequest(pub async_graphql::Request);
+```
+
+Since it consumes the body on POST, it implements `FromRequest` (not `FromRequestParts`). The macro already handles `FromRequest` types correctly — no `rapina-macros` changes required.
+
+**PR: #1**
+
+---
+
+### 3. `GraphQLResponse` responder — `rapina/src/graphql/response.rs`
+
+Create a `GraphQLResponse` struct that wraps `async_graphql::Response` and implements `IntoResponse`:
+
+```rust
+pub struct GraphQLResponse(pub async_graphql::Response);
+
+impl IntoResponse for GraphQLResponse {
+    fn into_response(self) -> http::Response<BoxBody> {
+        let body = serde_json::to_vec(&self.0).unwrap();
+        let status = if self.0.is_err() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        };
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap()
+    }
+}
+```
+
+Key detail: `async_graphql::Response` has an `.is_err()` method that checks whether the response contains errors, making status selection clean.
 
 This eliminates the manual `http::Response::builder()` boilerplate from the POC's `handlers.rs`.
 
-#### 4. `RapinaGraphQLContext` — `rapina/src/graphql/context.rs`
+**PR: #1**
 
-Define a trait and a concrete context builder that bridges Rapina's request-level data into Juniper:
+---
 
+### 4. `RapinaGraphQLContext` — `rapina/src/graphql/context.rs`
 
+async-graphql uses `Context<'_>` with type-map data injection via `Schema::build().data(...)` or per-request `Request::data(...)`. Unlike Juniper (which passes a user-defined `Context` struct), async-graphql's context is an extensible type-map — resolvers call `ctx.data::<T>()` or `ctx.data_unchecked::<T>()` to retrieve values.
 
-Provide a built-in `DefaultGraphQLContext` that carries:
-- `current_user: Option<CurrentUser>` — `None` when unauthenticated, `Some(...)` when JWT is present.
-- `trace_id: String` — from Rapina's `RequestContext`, threaded into error extensions.
-- Generic `state: Arc<AppState>` — so the user can `.get::<Pool>()` or any other registered state.
+Rapina's bridge injects request-scoped data into each `async_graphql::Request` before execution:
 
-The context is constructed **inside the built-in handler** (step 6) by reading `CurrentUser` from request extensions (it's `Option` — won't fail on public endpoints) and `RequestContext` for the trace ID.
+```rust
+/// Holds request-scoped data to be injected into the async-graphql context.
+pub struct RapinaGraphQLContext {
+    pub current_user: Option<CurrentUser>,
+    pub trace_id: String,
+}
+```
 
-Users who need a custom context implement the `GraphQLContext` trait on their own type and gain the same auto-construction.
+The built-in handler (step 6) constructs this per-request and injects it:
 
-#### 5. Error bridging — `rapina/src/graphql/error.rs`
+```rust
+let ctx = RapinaGraphQLContext {
+    current_user,  // from request extensions (Option — None on public endpoints)
+    trace_id,      // from Rapina's RequestContext
+};
 
-Provide conversions between the two error systems:
+let request = gql_request.0.data(ctx);
+let response = schema.execute(request).await;
+```
 
-- **Rapina → Juniper:** `impl From<rapina::Error> for juniper::FieldError` — maps `Error::not_found(msg)` into a `FieldError` whose extensions include `{ "code": "NOT_FOUND", "trace_id": "..." }`.
-- **Juniper → Rapina:** A helper `graphql_error(code, message)` that creates a `FieldError` pre-populated with Rapina's error code vocabulary (`BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, etc.) and the current `trace_id`.
-- **`IntoFieldError` trait:** A convenience trait similar to `IntoApiError` but for GraphQL:
+Resolvers access it via the standard async-graphql pattern:
 
+```rust
+#[Object]
+impl QueryRoot {
+    async fn me(&self, ctx: &Context<'_>) -> Result<User> {
+        let rapina_ctx = ctx.data::<RapinaGraphQLContext>()?;
+        let user = rapina_ctx.current_user
+            .as_ref()
+            .ok_or_else(|| Error::new("Unauthorized"))?;
+        // ...
+    }
+}
+```
 
+Users who need additional context data can insert it via `request.data(...)` — async-graphql's type-map is open for extension, no custom trait required.
+
+**PR: #2**
+
+---
+
+### 5. Error bridging — `rapina/src/graphql/error.rs`
+
+Provide conversions between the two error systems. async-graphql uses `async_graphql::Error` (with `.extend_with()` for extensions) rather than Juniper's `FieldError`:
+
+- **Rapina → async-graphql:** `impl From<rapina::Error> for async_graphql::Error` — maps `Error::not_found(msg)` into an `async_graphql::Error` whose extensions include `{ "code": "NOT_FOUND", "trace_id": "..." }`.
+
+```rust
+impl From<rapina::Error> for async_graphql::Error {
+    fn from(err: rapina::Error) -> Self {
+        let code = err.error_code();  // e.g. "NOT_FOUND"
+        async_graphql::Error::new(err.message())
+            .extend_with(|_, e| {
+                e.set("code", code);
+            })
+    }
+}
+```
+
+- **Helper function:** `graphql_error(code, message, trace_id)` creates an `async_graphql::Error` pre-populated with Rapina's error code vocabulary and the current `trace_id`:
+
+```rust
+pub fn graphql_error(code: &str, message: impl Into<String>, trace_id: &str) -> async_graphql::Error {
+    async_graphql::Error::new(message)
+        .extend_with(|_, e| {
+            e.set("code", code);
+            e.set("trace_id", trace_id);
+        })
+}
+```
+
+- **`IntoGraphQLError` trait:** A convenience trait similar to `IntoApiError` but for GraphQL, allowing user-defined error types to convert cleanly:
+
+```rust
+pub trait IntoGraphQLError {
+    fn into_graphql_error(self, trace_id: &str) -> async_graphql::Error;
+}
+```
 
 This ensures GraphQL error responses carry `trace_id` for production debugging, consistent with Rapina's REST error envelope.
 
-#### 6. Built-in handlers — `rapina/src/graphql/handler.rs`
+**PR: #2**
 
-Provide three ready-made handler functions (not macro-based, raw closures compatible with `Router::route()`):
+---
 
-- **`graphql_handler`** — Handles both POST and GET. Extracts `GraphQLRequest`, builds the context (step 4), executes the query against the schema from `State`, returns `GraphQLResponse`.
-- **`graphiql_handler`** — Serves the GraphiQL HTML UI. Takes the GraphQL endpoint path as a parameter. Returns `Content-Type: text/html`.
+### 6. Built-in handlers — `rapina/src/graphql/handler.rs`
 
-These are generic over the user's schema and context types.
+Provide ready-made handler functions (raw closures compatible with `Router::route()`):
 
-#### 7. Router extension — `rapina/src/graphql/router.rs`
+- **`graphql_handler`** — Handles both POST and GET. Extracts `GraphQLRequest`, reads `CurrentUser` and `RequestContext` from request extensions, injects `RapinaGraphQLContext` into the async-graphql `Request`, executes against the schema from `State`, returns `GraphQLResponse`.
 
-Add a convenience method to `Router` (or a standalone builder) to mount everything in one call:
+```rust
+async fn graphql_handler(
+    state: State<GraphQLSchema>,
+    ctx: Option<CurrentUser>,
+    request_ctx: RequestContext,
+    gql_request: GraphQLRequest,
+) -> GraphQLResponse {
+    let rapina_ctx = RapinaGraphQLContext {
+        current_user: ctx,
+        trace_id: request_ctx.trace_id().to_string(),
+    };
+    let request = gql_request.0.data(rapina_ctx);
+    GraphQLResponse(state.execute(request).await)
+}
+```
 
+- **`graphiql_handler`** — Serves the GraphiQL HTML UI. async-graphql provides `async_graphql::http::GraphiQLSource` which generates the HTML:
 
+```rust
+async fn graphiql_handler() -> impl IntoResponse {
+    let html = GraphiQLSource::build().endpoint("/graphql").finish();
+    http::Response::builder()
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(html)))
+        .unwrap()
+}
+```
 
-`.graphql(path, ...)` registers both `POST` and `GET` handlers at the given path.
-`.graphiql(path, graphql_endpoint)` registers a `GET` handler serving the playground UI.
+The schema type is `async_graphql::Schema<Query, Mutation, EmptySubscription>` — generic over the user's `Query` and `Mutation` root types.
 
-Alternatively, provide a `GraphQLRouter::new(schema).with_playground(true).build()` that returns a `Router` which can be merged via `.group()`:
+**PR: #3**
 
+---
 
+### 7. Router builder methods — `rapina/src/graphql/router.rs`
 
-#### 8. Update `rapina-macros` — `rapina-macros/src/lib.rs`
+Add convenience methods directly on the `Rapina` builder to mount GraphQL routes, aligning with existing builder methods (`with_cors`, `with_rate_limit`, etc.):
 
-In `is_parts_only_extractor()` (line ~195), the function already recognizes `CurrentUser` as parts-only. No changes needed for the built-in handlers (they use raw closures). If we want users to use `GraphQLRequest` as a macro-extracted param, it will be correctly treated as a body-consuming extractor since its type name won't match any of the parts-only patterns — so **no macro changes required**.
+```rust
+Rapina::new()
+    .graphql("/graphql", schema)
+    .graphiql("/graphiql")
+    .listen("127.0.0.1:3000")
+    .await
+```
 
-#### 9. Re-export from `rapina::prelude` and `rapina::graphql`
+Implementation:
 
-In `rapina/src/lib.rs`, expose:
+- **`.graphql(path, schema)`** — Stores the schema as shared state and registers both `POST` and `GET` handlers at the given path. The schema is wrapped in `Arc` internally.
+- **`.graphiql(path)`** — Registers a `GET` handler serving the GraphiQL playground UI. Infers the GraphQL endpoint from the previously registered `.graphql()` call or accepts an explicit override: `.graphiql_at("/graphiql", "/graphql")`.
 
-In `rapina/src/prelude.rs`, optionally re-export key types:
+Under the hood, `.graphql()` creates a `Router` fragment with the two routes, stores the schema as `State`, and merges it into the app's router — same pattern as `.router()` today.
 
+**PR: #3**
 
+---
 
-#### 10. Add `juniper` as a dependency to `rapina/Cargo.toml`
+### 8. Update `rapina-macros` — `rapina-macros/src/lib.rs`
 
-Add `juniper = "0.16"` to the rapina crate dependencies.
+No macro changes required. The built-in handlers use raw closures/functions compatible with `Router::route()`. The `GraphQLRequest` extractor implements `FromRequest` (body-consuming), which the macro already handles correctly — its type name won't match any parts-only patterns in `is_parts_only_extractor()`.
 
-#### 11. Documentation and example
+**PR: N/A — no changes**
 
-- Add a `rapina/examples/graphql.rs` example demonstrating the full setup with users/products, DB pool, auth-aware resolvers.
+---
+
+### 9. Re-export from `rapina::graphql`
+
+In `rapina/src/lib.rs` (behind `#[cfg(feature = "graphql")]`):
+
+```rust
+#[cfg(feature = "graphql")]
+pub mod graphql;
+```
+
+The `rapina::graphql` module re-exports:
+
+```rust
+pub use self::request::GraphQLRequest;
+pub use self::response::GraphQLResponse;
+pub use self::context::RapinaGraphQLContext;
+pub use self::error::{graphql_error, IntoGraphQLError};
+```
+
+Optionally re-export in `rapina::prelude` behind the feature gate:
+
+```rust
+#[cfg(feature = "graphql")]
+pub use crate::graphql::{GraphQLRequest, GraphQLResponse, RapinaGraphQLContext};
+```
+
+**PR: #1 (initial), expanded in #2**
+
+---
+
+### 10. Add `async-graphql` as an optional dependency to `rapina/Cargo.toml`
+
+```toml
+[features]
+default = []
+graphql = ["dep:async-graphql"]
+
+[dependencies]
+async-graphql = { version = "7", optional = true }
+```
+
+**PR: #1**
+
+---
+
+### 11. Documentation and example
+
+- Add a `rapina/examples/graphql.rs` example demonstrating the full setup: schema with `#[Object]` derives, DB pool via `ctx.data::<Pool>()`, auth-aware resolvers, builder-style mounting.
 - Add a docs page at `docs/content/docs/core-concepts/graphql.md`.
 
+The example should show the target DX:
+
+```rust
+use rapina::prelude::*;
+use async_graphql::{Object, Context, EmptySubscription, Schema};
+
+struct QueryRoot;
+
+#[Object]
+impl QueryRoot {
+    async fn hello(&self) -> &str {
+        "Hello from Rapina + async-graphql!"
+    }
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+        .finish();
+
+    Rapina::new()
+        .graphql("/graphql", schema)
+        .graphiql("/graphiql")
+        .listen("127.0.0.1:3000")
+        .await
+}
+```
+
+**PR: #4**
+
 ---
 
-### Verification
+## Verification
 
-1. **Unit tests** in `rapina/src/graphql/` for each component:
+### Per-PR tests
+
+1. **PR #1** — Unit tests in `rapina/src/graphql/`:
    - `request.rs` — test POST JSON extraction, GET query-param extraction, malformed input returns 400.
-   - `response.rs` — test `IntoResponse` serialization, status codes for success/error.
-   - `context.rs` — test context construction with and without `CurrentUser`.
-   - `error.rs` — test `From<Error> for FieldError` round-trips, `trace_id` inclusion.
+   - `response.rs` — test `IntoResponse` serialization, status 200 for success, 400 for errors via `.is_err()`.
 
-2. **Integration tests** in `rapina/tests/graphql.rs`:
-   - Mount a simple schema via `GraphQLRouter`, use `TestClient` to send queries/mutations.
-   - Verify GraphiQL playground returns HTML.
-   - Verify unauthenticated request → `current_user` is `None` in context.
-   - Verify authenticated request (JWT header) → `current_user` is `Some(...)` in context.
+2. **PR #2** — Unit tests:
+   - `context.rs` — test `RapinaGraphQLContext` injection, resolvers can access `current_user` and `trace_id` via `ctx.data::<RapinaGraphQLContext>()`.
+   - `error.rs` — test `From<rapina::Error> for async_graphql::Error`, verify `trace_id` and `code` appear in extensions.
+
+3. **PR #3** — Integration tests in `rapina/tests/graphql.rs`:
+   - Mount a schema via `.graphql()`, use `TestClient` to send queries/mutations.
+   - Verify unauthenticated request → `current_user` is `None`.
+   - Verify authenticated request (JWT header) → `current_user` is `Some(...)`.
    - Verify error responses include `trace_id` in GraphQL error extensions.
 
-3. **Manual smoke test** with the POC app migrated to use the new API — the `rapina-app` should simplify from ~80 lines in `handlers.rs` to ~10 lines.
+4. **PR #4** — Integration tests:
+   - Verify GraphiQL playground returns HTML with correct endpoint URL.
+   - Example compiles and runs.
+
+### Manual smoke test
+
+Migrate the POC `rapina-app` to use the new API. The app should simplify from ~80 lines in `handlers.rs` to roughly:
+
+```rust
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let pool = get_db_pool();
+    let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .data(pool)
+        .finish();
+
+    Rapina::new()
+        .graphql("/graphql", schema)
+        .graphiql("/graphiql")
+        .listen("127.0.0.1:3000")
+        .await
+}
+```
 
 ---
 
-### Decisions
+## Decisions
 
-- **Core, not plugin:** GraphQL lives in the core crate. Juniper is a direct dependency. This keeps the developer experience simple — one `use rapina::graphql::*` import.
-- **Juniper only:** No abstraction layer over GraphQL libraries. Direct Juniper types. If async-graphql support is needed later, it would be a second module (`rapina::async_graphql`), not a shared trait.
-- **Per-resolver auth:** The `/graphql` endpoint is implicitly public (the `GraphQLRouter` registers it as a public route). `Option<CurrentUser>` flows into the Juniper context. Resolvers call `ctx.current_user().ok_or(...)` to enforce auth. This follows the GraphQL community convention where a single endpoint handles mixed public/private operations.
-- **No subscriptions:** `EmptySubscription` only. WebSocket support deferred. The `RootNode` type parameter uses `EmptySubscription<Context>`.
-- **Trace ID in errors:** Every `FieldError` produced via the Rapina helpers includes `trace_id` in the `extensions` object, matching the REST error envelope pattern.
+- **Feature flag, not core:** GraphQL lives in the main crate but behind `#[cfg(feature = "graphql")]`. The `async-graphql` dependency is optional. REST-only users pay zero cost.
+- **async-graphql, not Juniper:** async-graphql has a more ergonomic API (`#[Object]`, `#[SimpleObject]`, `#[InputObject]` derives), native async, built-in `DataLoader`, and stronger community momentum. Direct async-graphql types — no abstraction layer.
+- **Per-resolver auth:** The `/graphql` endpoint is implicitly public. `Option<CurrentUser>` is injected into async-graphql's context via `Request::data()`. Resolvers call `ctx.data::<RapinaGraphQLContext>()?.current_user.as_ref().ok_or(...)` to enforce auth. This follows the GraphQL convention where a single endpoint handles mixed public/private operations.
+- **No subscriptions (for now):** `EmptySubscription` only. WebSocket support deferred to a follow-up. Focus on queries and mutations first.
+- **Trace ID in errors:** Every error produced via Rapina's GraphQL helpers includes `trace_id` in the `extensions` object, matching the REST error envelope pattern.
+- **Incremental PRs:** The feature is broken into 4 self-contained PRs, each reviewable and testable independently.
